@@ -1,0 +1,163 @@
+import threading
+import time
+
+import requests
+import json
+import os
+from aiogram.dispatcher import FSMContext
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.types import Message
+from aiogram import Bot, Dispatcher, types
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.utils import executor
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+import psycopg2
+from aiogram.types.bot_command_scope import BotCommandScopeDefault
+import numpy
+import asyncio
+
+conn = psycopg2.connect(
+    database='postgres',
+    user='postgres',
+    password='postgres',
+    port='5432'
+)
+cursor = conn.cursor()
+
+API_TOKEN = os.environ['API_TOKEN']
+bot = Bot(API_TOKEN)
+dp = Dispatcher(bot, storage=MemoryStorage())
+
+commands = [
+    types.BotCommand(command='/start', description='Начало'),
+    types.BotCommand(command='/load', description='Добавить ценную бумагу к портфелю'),
+    types.BotCommand(command='/show', description='Показатели отслеживаемых ценных бумаг'),
+    types.BotCommand(command='/delete', description='Удалить ценную бумагу из портфеля')
+]
+
+
+async def setup_bot_commands(arg):
+    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+
+
+class States(StatesGroup):
+    start = State()
+    load_name = State()
+    delete_name = State()
+    showState = State()
+
+
+@dp.message_handler(commands=['start'])
+async def fun1(message: Message):
+    await States.start.set()
+    await message.reply('Выберите действие из меню')
+
+
+@dp.message_handler(commands=['load'])
+async def fun3(message: Message):
+    await States.load_name.set()
+    await message.reply('Введите имя ценной бумаги')
+
+
+@dp.message_handler(state=States.load_name.state)
+async def fun10(message: Message, state: FSMContext):
+    name = message.text
+    cursor.execute("INSERT INTO paper (paperName, dailyEarnValue, dailYEarnError) VALUES (%s, %s, %s)", (name, 0, 0))
+    conn.commit()
+    cursor.execute("SELECT lastval()")
+    paper_id = cursor.fetchone()[0]
+    calculate_paper(paper_id)
+    await message.reply('Ценная бумага ' + str(name) + ' добавлена к отслеживаемым')
+    await state.finish()
+
+
+@dp.message_handler(commands=['delete'])
+async def fun11(message: Message):
+    await States.delete_name.set()
+    await message.reply('Введите имя ценной бумаги, которую нужно удалить')
+
+
+@dp.message_handler(state=States.delete_name.state)
+async def fun12(message: Message, state: FSMContext):
+    name = message.text
+    cursor.execute("DELETE FROM paper WHERE paperName = %s", (name,))
+    conn.commit()
+    await message.reply('Ценная бумага ' + str(name) + ' удалена из портфеля')
+    await state.finish()
+
+
+@dp.message_handler(commands=['show'])
+async def show_papers(message: Message):
+    cursor.execute(f'SELECT paperName, dailyEarnValue, dailYEarnError FROM paper')
+    results = cursor.fetchall()
+
+    if results:
+        response = "Бумага | Ежедневная доходность | Стандартное отклонение\n"
+
+        for result in results:
+            paper_name = result[0]
+            daily_earnings = result[1]
+            earnings_error = result[2]
+
+            line = f"{paper_name} | {daily_earnings} | {earnings_error}\n"
+            response += line
+
+        await message.reply(response)
+    else:
+        await message.reply("Нет доступных данных о ценных бумагах.")
+
+
+APIKey = "Z0YC4ZNTX7CWZYFA"
+
+
+def calculate_paper(paper_id):
+    cursor.execute("SELECT paperName FROM paper WHERE id = %s", (paper_id,))
+    result = cursor.fetchone()
+    if result:
+        paper_name = result[0]
+        url = f'https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol={paper_name}&apikey={APIKey}'
+        response = requests.get(url)
+        data = json.loads(response.text)
+        series = data['Time Series (Daily)']
+        lst = []
+        counter = 0
+        temp = ""
+
+        for i in series:
+            if counter == 30:
+                break
+            if temp == "":
+                temp = series[i]['4. close']
+                lst.append(float(temp))
+                continue
+
+            current_close = series[i]['4. close']
+            yest = temp
+            dailyEarn = ((float(yest) - float(current_close)) / float(current_close))
+            dailyEarn += dailyEarn
+            counter += 1
+            temp = current_close
+            lst.append(float(temp))
+
+        dailyEarnValue = dailyEarn / 30
+        dailYEarnError = numpy.std(numpy.array(lst))
+        cursor.execute("UPDATE paper SET dailyEarnValue = %s, dailYEarnError = %s WHERE id = %s",
+                       (dailyEarnValue, dailYEarnError, paper_id))
+        conn.commit()
+
+
+def daily_task():
+    while True:
+        cursor.execute(f"SELECT * FROM paper")
+        papers = cursor.fetchall()
+
+        for i in papers:
+            calculate_paper(i[0])
+
+        time.sleep(24 * 60 * 60)
+
+
+if __name__ == '__main__':
+    thread = threading.Thread(target=daily_task)
+    thread.start()
+    executor.start_polling(dp, skip_updates=True, on_startup=setup_bot_commands)
